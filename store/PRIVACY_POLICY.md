@@ -1,8 +1,8 @@
-# Privacy Policy — Noderra Rush: Traffic Racer
+# Privacy Policy — GOT RIDER
 
 Last updated: 15 November 2026
 
-Noderra Rush: Traffic Racer ("the app") is developed by Praveen Kumar / Noderra Tech ("we").
+GOT RIDER ("the app") is developed by Praveen Kumar / Noderra Tech ("we").
 
 ## Data we collect
 We do **not** collect, store on our servers, share or sell any personal data. The app has no accounts, no ads, no analytics and no third-party SDKs that track you. It does not need an internet connection.
@@ -13,6 +13,7 @@ Game progress (credits, XP, best score, owned vehicles, settings) is saved local
 ## Sensors and permissions
 - **Motion sensors (accelerometer / device motion):** used only in real time to steer the vehicle by tilting your phone. Sensor data is not recorded or sent anywhere.
 - **Text-to-speech:** the challenge voice uses your phone's built-in speech engine. Nothing is recorded, and no text or audio is sent to us.
+- **Audio:** the app only plays sounds. It never records audio and does not use the microphone.
 - **Vibration:** used for haptic feedback (e.g. on a crash). 
 The app does not access your location, camera, microphone, contacts, photos or files.
 

@@ -1,6 +1,10 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  Animated,
+  Easing,
+  Image,
   PanResponder,
+  AppState,
   Platform,
   Pressable,
   ScrollView,
@@ -8,6 +12,7 @@ import {
   StyleSheet,
   Text,
   View,
+  useWindowDimensions,
 } from 'react-native';
 import { GLView } from 'expo-gl';
 import { Accelerometer, DeviceMotion } from 'expo-sensors';
@@ -16,13 +21,16 @@ import * as ScreenOrientation from 'expo-screen-orientation';
 import * as Speech from 'expo-speech';
 import * as THREE from 'three';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import Sound from './sound';
+import appJson from './app.json';
 
 // =====================================================================
-//  NODERRA RUSH  -  endless 3D traffic racer
+//  GOT RIDER  -  endless 3D traffic racer  (RULE THE ROAD)
 //  Road ka left half (x < 0) = saamne se aati traffic (wrong way, x2 score)
 //  Road ka right half (x > 0) = aapki direction ki traffic
 // =====================================================================
 
+// NOTE: internal storage key - intentionally NOT renamed so existing players keep their progress.
 const SAVE_KEY = 'noderra_rush_save_v1';
 
 const KMH = 0.2; // 1 km/h = 0.2 world units / second
@@ -51,17 +59,24 @@ const goalFor = (V) => {
 const FULL_DEG = { low: 55, med: 40, high: 30 }; // is angle par full steering
 
 const C = {
-  bg: '#0b1220',
-  card: '#121a2b',
-  line: '#1f2a44',
+  bg: '#0a0a0d',
+  card: '#15151b',
+  line: '#26262f',
   text: '#f8fafc',
-  muted: '#94a3b8',
-  accent: '#ff7a18',
-  cyan: '#22d3ee',
+  muted: '#9ca3af',
+  accent: '#ff2d3d', // GOT RIDER racing red
+  cyan: '#d5dae3', // (name kept) GOT RIDER chrome silver
   good: '#22c55e',
   bad: '#ef4444',
   gold: '#fbbf24',
 };
+
+// ---------- GOT RIDER branding ----------
+const LOGO = require('./assets/logo.png');
+const HOME_BG = require('./assets/home-bg.jpg');
+const LOGO_ASPECT = 1600 / 1154;
+const TAGLINE = 'RULE THE ROAD';
+const APP_VERSION = (appJson && appJson.expo && appJson.expo.version) || '1.0.0';
 
 // ---------- Vehicles (apne original designs, kisi brand ke nahi) ----------
 const VEHICLES = [
@@ -98,14 +113,14 @@ const levelProgress = (xp) => {
   return { level, pct: (xp - a) / (b - a), into: Math.floor(xp - a), need: b - a };
 };
 
-const DEFAULT_SETTINGS = { sens: 'med', invert: false, voice: true };
+const DEFAULT_SETTINGS = { sens: 'med', invert: false, voice: true, mode: 'classic', sound: true, music: true, engine: true, sfx: true };
 const DEFAULT_SAVE = { credits: 0, xp: 0, best: 0, runs: 0, owned: { cycle: true }, selected: 'cycle', settings: DEFAULT_SETTINGS, goals: {}, missions: null, missionsDone: 0, challenge: null, challengesDone: 0 };
 const fmt = (n) => String(Math.floor(n)).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
 const rand = (a, b) => a + Math.random() * (b - a);
 const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
 
 const rankFor = (L) =>
-  L >= 40 ? 'Rush Legend' : L >= 30 ? 'Road King' : L >= 25 ? 'Speed Legend' : L >= 20 ? 'Turbo Ace' : L >= 15 ? 'Highway Hero' : L >= 10 ? 'Road Hunter' : L >= 5 ? 'Street Racer' : 'Rookie';
+  L >= 40 ? 'Rider Legend' : L >= 30 ? 'Road King' : L >= 25 ? 'Speed Legend' : L >= 20 ? 'Turbo Ace' : L >= 15 ? 'Highway Hero' : L >= 10 ? 'Road Hunter' : L >= 5 ? 'Street Racer' : 'Rookie';
 
 // true karne par saare normal missions ke targets x4 ho jaate hain ("sab impossible" mode)
 const ALL_IMPOSSIBLE = false;
@@ -178,6 +193,8 @@ const TAUNTS = [
   { hi: 'बस इतना ही दम है तुझमें?', en: 'IS THAT ALL YOU GOT?' },
   { hi: 'हार मान ले, ये तेरे बस की बात नहीं!', en: 'GIVE UP, THIS IS BEYOND YOU!' },
 ];
+// accident par aas-paas ke log bolte hain (device TTS)
+const CROWD = ['अरे अरे अरे!', 'हाय राम!', 'Oh no!', 'देखो देखो, गिर गया!', 'अरे भाई, ठीक है ना?', 'बचाओ!'];
 const CRASH_TAUNT = { hi: 'हा हा! मैंने कहा था, नहीं हो पाएगा!', en: 'HA HA! TOLD YOU!' };
 const WIN_TAUNT = { hi: 'क्या... ये कैसे हो गया? ठीक है, इस बार जीत गया तू!', en: 'WHAT?! HOW?! FINE... YOU WIN THIS ONE' };
 
@@ -188,10 +205,21 @@ const TRAFFIC = {
   van: { len: 4.8, hw: 0.95 },
   bus: { len: 8, hw: 1.15 },
   truck: { len: 9.6, hw: 1.15 },
+  // new: emergency / local traffic
+  police: { len: 4.4, hw: 0.9, dtv: 7, dfrac: 0.28 },
+  ambulance: { len: 4.8, hw: 0.95, dtv: 9, dfrac: 0.32 },
+  auto: { len: 2.8, hw: 0.8, dtv: -5, dfrac: -0.25 },
+  // new: road obstacles (stand still on the road)
+  cones: { len: 3.2, hw: 1.0, obs: true, soft: true, dmgK: 0.35 },
+  barrier: { len: 0.8, hw: 1.25, obs: true, dmgK: 1.2 },
 };
 const TRAFFIC_COLORS = ['#ef4444', '#3b82f6', '#f8fafc', '#94a3b8', '#facc15', '#10b981', '#f97316', '#6366f1', '#1f2937'];
 const LANE_TRAFFIC = [{ tv: 15 }, { tv: 11 }, { frac: 0.6 }, { frac: 0.4 }];
 const pickType = (lvl) => {
+  const q = Math.random();
+  if (lvl >= 8 && q < 0.04) return 'ambulance';
+  if (lvl >= 4 && q >= 0.04 && q < 0.11) return 'police';
+  if (q > 0.88) return 'auto';
   const r = Math.random();
   if (lvl >= 7 && r < 0.15) return 'truck';
   if (lvl >= 5 && r < 0.3) return 'bus';
@@ -869,9 +897,98 @@ function buildVehicle(v, player) {
   return makeCar(v.car, v.color, player, true);
 }
 
+// flashing roof lights (red / blue); loop toggles visibility
+const flashBar = (g, y, z, w) => {
+  g.add(box(w * 1.7, 0.06, 0.3, '#111827', 0, y, z));
+  const a = box(w * 0.75, 0.1, 0.24, glow('#ff1f3a'), -w * 0.45, y + 0.08, z);
+  const b = box(w * 0.75, 0.1, 0.24, glow('#2b6bff'), w * 0.45, y + 0.08, z);
+  g.add(a);
+  g.add(b);
+  g.userData.flash = [a, b];
+};
+
 const HATCH_O = { w: 1.7, l: 3.7, h: 0.62, cabH: 0.6, cabL: 2.0, cabZ: 0.25, wheelR: 0.34 };
 const SEDAN_O = { w: 1.8, l: 4.4, h: 0.66, cabH: 0.6, cabL: 2.3, cabZ: 0.2, wheelR: 0.36 };
+function makePolice() {
+  const o = { w: 1.8, l: 4.4, h: 0.66, cabH: 0.6, cabL: 2.3, cabZ: 0.2, wheelR: 0.36 };
+  const g = makeCar(o, '#f8fafc', false, 1);
+  const y0 = o.wheelR * 0.62;
+  [-1, 1].forEach((sx) => {
+    g.add(box(0.03, 0.2, 2.2, '#111827', sx * (o.w / 2 + 0.015), y0 + o.h * 0.5, o.cabZ + 0.1));
+    g.add(box(0.03, 0.1, 0.9, '#1d4ed8', sx * (o.w / 2 + 0.02), y0 + o.h * 0.5, o.cabZ + 0.1));
+  });
+  g.add(box(o.w * 0.9, 0.08, 0.6, '#111827', 0, y0 + o.h + 0.04, -o.l / 2 + 0.5));
+  flashBar(g, y0 + o.h + o.cabH + 0.08, o.cabZ, 0.55);
+  return g;
+}
+
+function makeAmbulance() {
+  const g = makeVan('#f8fafc');
+  [-1, 1].forEach((sx) => {
+    g.add(box(0.03, 0.55, 0.15, '#dc2626', sx * 0.97, 1.2, 1.0));
+    g.add(box(0.03, 0.15, 0.55, '#dc2626', sx * 0.97, 1.2, 1.0));
+    g.add(box(0.03, 0.14, 2.3, '#dc2626', sx * 0.97, 0.72, 1.0));
+  });
+  flashBar(g, 2.0, 0.9, 0.6);
+  return g;
+}
+
+function makeAuto() {
+  const g = new THREE.Group();
+  g.userData.wheels = [];
+  g.add(rbox(2.2, 0.7, 1.2, 0.12, phong('#16a34a', 50, '#888888'), 0, 0.3, 0.2));
+  g.add(rbox(1.9, 0.12, 1.35, 0.06, phong('#facc15', 40, '#888888'), 0, 1.55, 0.35));
+  [-1, 1].forEach((sx) => {
+    g.add(box(0.05, 0.85, 0.05, '#111827', sx * 0.62, 1.1, -0.5));
+    g.add(box(0.05, 0.85, 0.05, '#111827', sx * 0.62, 1.1, 1.0));
+  });
+  g.add(box(1.1, 0.55, 0.05, phong('#1b2a3d', 140, '#ffffff'), 0, 1.15, -0.62));
+  g.add(box(1.0, 0.4, 0.45, '#111827', 0, 0.85, 0.5)); // seat
+  g.add(ball(0.1, glow('#fff7c2'), 0, 0.6, -1.12, 1, 1, 0.6));
+  [-1, 1].forEach((sx) => g.add(box(0.2, 0.1, 0.05, glow('#dc2626'), sx * 0.45, 0.55, 1.33)));
+  [[0, 0.28, -1.0], [-0.62, 0.28, 0.85], [0.62, 0.28, 0.85]].forEach(([x, y, z]) => {
+    const wl = carWheel(0.28, 0.16, x, y, z, false);
+    g.add(wl.node);
+    g.userData.wheels.push(wl);
+  });
+  return g;
+}
+
+function makeCones() {
+  const g = new THREE.Group();
+  g.userData.wheels = [];
+  const orange = phong('#f97316', 30, '#444444');
+  [[-0.7, -1.2], [0, 0], [0.7, 1.2], [-0.7, 1.2], [0.7, -1.2]].forEach(([x, z]) => {
+    const m = new THREE.Mesh(coneGeo(0.2, 0.6), orange);
+    m.position.set(x, 0.3, z);
+    g.add(m);
+    g.add(box(0.46, 0.04, 0.46, '#1f2937', x, 0.02, z));
+  });
+  return g;
+}
+
+function makeBarrier() {
+  const g = new THREE.Group();
+  g.userData.wheels = [];
+  for (let i = 0; i < 4; i++) g.add(box(0.5, 0.32, 0.12, i % 2 ? '#f8fafc' : '#dc2626', -0.75 + i * 0.5, 0.85, 0));
+  [-1, 1].forEach((sx) => {
+    g.add(box(0.08, 0.9, 0.08, '#374151', sx * 0.8, 0.45, 0));
+    g.add(box(0.1, 0.05, 0.7, '#374151', sx * 0.8, 0.03, 0));
+  });
+  const a = ball(0.11, glow('#ffb300'), -0.8, 1.15, 0);
+  const b = ball(0.11, glow('#ffb300'), 0.8, 1.15, 0);
+  g.add(a);
+  g.add(b);
+  g.userData.flash = [a, b];
+  return g;
+}
+
 function makeTraffic(type, color) {
+  if (type === 'police') return makePolice();
+  if (type === 'ambulance') return makeAmbulance();
+  if (type === 'auto') return makeAuto();
+  if (type === 'cones') return makeCones();
+  if (type === 'barrier') return makeBarrier();
   if (type === 'hatch' || type === 'sedan') {
     const o = type === 'hatch' ? HATCH_O : SEDAN_O;
     const g = makeCar(o, color, false, 1);
@@ -936,7 +1053,7 @@ function GaragePreview({ vehicleId }) {
       clearCaches();
       const { renderer, w, h } = makeRenderer(gl);
       const scene = new THREE.Scene();
-      scene.background = new THREE.Color('#0e1626');
+      scene.background = new THREE.Color('#0d0d12');
       const camera = new THREE.PerspectiveCamera(38, w / h, 0.1, 100);
       camera.position.set(0, 3.0, 8.2);
       camera.lookAt(0, 0.9, 0);
@@ -944,20 +1061,20 @@ function GaragePreview({ vehicleId }) {
       const key = new THREE.DirectionalLight('#ffffff', 0.95);
       key.position.set(5, 8, 6);
       scene.add(key);
-      const rim = new THREE.DirectionalLight('#22d3ee', 0.55);
+      const rim = new THREE.DirectionalLight('#cfd6e4', 0.55);
       rim.position.set(-6, 4, -4);
       scene.add(rim);
-      const warm = new THREE.PointLight('#ff7a18', 0.7, 22);
+      const warm = new THREE.PointLight('#ff2d3d', 0.7, 22);
       warm.position.set(4, 2.5, 5);
       scene.add(warm);
-      const ring2 = new THREE.Mesh(new THREE.TorusGeometry(2.4, 0.025, 8, 60), mat('#ff7a18'));
+      const ring2 = new THREE.Mesh(new THREE.TorusGeometry(2.4, 0.025, 8, 60), mat('#ff2d3d'));
       ring2.rotation.x = Math.PI / 2;
       ring2.position.y = 0.012;
       scene.add(ring2);
-      const floor = new THREE.Mesh(new THREE.CylinderGeometry(3.2, 3.2, 0.12, 40), mat('#16213a'));
+      const floor = new THREE.Mesh(new THREE.CylinderGeometry(3.2, 3.2, 0.12, 40), mat('#17171f'));
       floor.position.y = -0.06;
       scene.add(floor);
-      const ring = new THREE.Mesh(new THREE.TorusGeometry(3.2, 0.04, 8, 60), mat('#22d3ee'));
+      const ring = new THREE.Mesh(new THREE.TorusGeometry(3.2, 0.04, 8, 60), mat('#cfd6e4'));
       ring.rotation.x = Math.PI / 2;
       ring.position.y = 0.01;
       scene.add(ring);
@@ -1040,6 +1157,212 @@ const Seg = ({ opts, value, onChange }) => (
 // =====================================================================
 //  App
 // =====================================================================
+// =====================================================================
+//  GOT RIDER branding components
+// =====================================================================
+function PressScale({ onPress, disabled, wrapStyle, style, children }) {
+  const sc = useRef(new Animated.Value(1)).current;
+  const to = (val) => Animated.spring(sc, { toValue: val, useNativeDriver: true, speed: 40, bounciness: 6 }).start();
+  return (
+    <Pressable disabled={disabled} onPress={onPress} onPressIn={() => to(0.96)} onPressOut={() => to(1)} style={wrapStyle}>
+      <Animated.View style={[style, { transform: [{ scale: sc }] }]}>{children}</Animated.View>
+    </Pressable>
+  );
+}
+
+const BrandMark = ({ width = 150, style }) => (
+  <Image source={LOGO} resizeMode="contain" style={[{ width, height: width / LOGO_ASPECT }, style]} />
+);
+
+function Streak({ x, delay, dur, h, color }) {
+  const { height } = useWindowDimensions();
+  const y = useRef(new Animated.Value(0)).current;
+  useEffect(() => {
+    const loop = Animated.loop(
+      Animated.sequence([
+        Animated.delay(delay),
+        Animated.timing(y, { toValue: 1, duration: dur, easing: Easing.in(Easing.quad), useNativeDriver: true }),
+        Animated.timing(y, { toValue: 0, duration: 0, useNativeDriver: true }),
+      ])
+    );
+    loop.start();
+    return () => loop.stop();
+  }, [y, delay, dur]);
+  const translateY = y.interpolate({ inputRange: [0, 1], outputRange: [-h, height] });
+  return <Animated.View pointerEvents="none" style={[styles.streak, { left: x, height: h, backgroundColor: color, transform: [{ translateY }] }]} />;
+}
+
+const STREAKS = [
+  { x: '8%', delay: 0, dur: 1500, h: 110, color: 'rgba(255,45,61,0.55)' },
+  { x: '23%', delay: 500, dur: 1900, h: 160, color: 'rgba(213,218,227,0.35)' },
+  { x: '41%', delay: 200, dur: 1300, h: 90, color: 'rgba(255,45,61,0.45)' },
+  { x: '62%', delay: 800, dur: 1700, h: 140, color: 'rgba(213,218,227,0.30)' },
+  { x: '78%', delay: 100, dur: 1400, h: 120, color: 'rgba(255,45,61,0.55)' },
+  { x: '92%', delay: 650, dur: 2000, h: 170, color: 'rgba(213,218,227,0.30)' },
+];
+
+// Cinematic intro / loading screen. Shown on top of the main menu at app launch, then fades out into it.
+function SplashIntro({ ready, onDone }) {
+  const { width, height } = useWindowDimensions();
+  const BAR = 220;
+  const fade = useRef(new Animated.Value(0)).current;
+  const scale = useRef(new Animated.Value(0.82)).current;
+  const prog = useRef(new Animated.Value(0)).current;
+  const out = useRef(new Animated.Value(1)).current;
+  const [minDone, setMinDone] = useState(false);
+  const [capped, setCapped] = useState(false);
+  const finished = useRef(false);
+
+  useEffect(() => {
+    Animated.parallel([
+      Animated.timing(fade, { toValue: 1, duration: 800, easing: Easing.out(Easing.cubic), useNativeDriver: true }),
+      Animated.timing(scale, { toValue: 1, duration: 1100, easing: Easing.out(Easing.back(1.3)), useNativeDriver: true }),
+      Animated.timing(prog, { toValue: 0.85, duration: 2000, easing: Easing.out(Easing.quad), useNativeDriver: true }),
+    ]).start();
+    const t1 = setTimeout(() => setMinDone(true), 2400);
+    const t2 = setTimeout(() => setCapped(true), 6000); // never get stuck on the splash
+    return () => {
+      clearTimeout(t1);
+      clearTimeout(t2);
+    };
+  }, [fade, scale, prog]);
+
+  useEffect(() => {
+    if (finished.current || !minDone || !(ready || capped)) return;
+    finished.current = true;
+    Animated.timing(prog, { toValue: 1, duration: 250, useNativeDriver: true }).start(() => {
+      Animated.timing(out, { toValue: 0, duration: 450, easing: Easing.in(Easing.quad), useNativeDriver: true }).start(() => onDone());
+    });
+  }, [minDone, ready, capped, prog, out, onDone]);
+
+  const logoW = Math.min(width * 0.86, height * 0.6 * LOGO_ASPECT);
+  const barX = prog.interpolate({ inputRange: [0, 1], outputRange: [-BAR, 0] });
+  return (
+    <Animated.View style={[styles.splashRoot, { opacity: out }]}>
+      <Image source={HOME_BG} resizeMode="cover" style={[StyleSheet.absoluteFill, { opacity: 0.5 }]} />
+      {STREAKS.map((st, i) => (
+        <Streak key={i} {...st} />
+      ))}
+      <Animated.View style={{ opacity: fade, transform: [{ scale }], alignItems: 'center' }}>
+        <BrandMark width={logoW} />
+      </Animated.View>
+      <Animated.View style={[styles.splashLoad, { opacity: fade }]}>
+        <View style={[styles.splashTrack, { width: BAR }]}>
+          <Animated.View style={[styles.splashFill, { width: BAR, transform: [{ translateX: barX }] }]} />
+        </View>
+        <Text style={styles.splashLoadTxt}>LOADING</Text>
+      </Animated.View>
+    </Animated.View>
+  );
+}
+
+// Main menu: logo, PLAY, GARAGE (bike / car selection), SETTINGS, ABOUT
+function HomeScreen({ save, loaded, vehicleName, onPlay, onGarage, setSetting }) {
+  const { width, height } = useWindowDimensions();
+  const land = width > height;
+  const [modal, setModal] = useState(null); // null | 'settings' | 'about'
+  const enter = useRef(new Animated.Value(0)).current;
+  useEffect(() => {
+    Animated.timing(enter, { toValue: 1, duration: 600, easing: Easing.out(Easing.cubic), useNativeDriver: true }).start();
+  }, [enter]);
+  const logoW = land ? Math.min(width * 0.46, height * 0.7 * LOGO_ASPECT) : Math.min(width * 0.88, height * 0.3 * LOGO_ASPECT);
+  const btnW = land ? Math.min(width * 0.36, 340) : Math.min(width * 0.82, 340);
+  const stg = save.settings;
+  const ty = enter.interpolate({ inputRange: [0, 1], outputRange: [16, 0] });
+
+  return (
+    <View style={styles.root}>
+      <StatusBar barStyle="light-content" />
+      <Image source={HOME_BG} resizeMode="cover" style={StyleSheet.absoluteFill} />
+      <View pointerEvents="none" style={[StyleSheet.absoluteFill, { backgroundColor: 'rgba(0,0,0,0.18)' }]} />
+      <Animated.View style={[land ? styles.homeBodyLand : styles.homeBody, { opacity: enter, transform: [{ translateY: ty }] }]}>
+        <View style={land ? styles.homeLogoColLand : styles.homeLogoCol}>
+          <BrandMark width={logoW} />
+        </View>
+        <View style={land ? styles.homeBtnColLand : styles.homeBtnCol}>
+          <PressScale disabled={!loaded} onPress={onPlay} style={[styles.playBtn, { width: btnW }, !loaded && { opacity: 0.5 }]}>
+            <Text style={styles.playBtnText}>PLAY</Text>
+            <Text style={styles.playBtnSub}>{String(vehicleName).toUpperCase()}</Text>
+          </PressScale>
+          <View style={[styles.homeRow, { width: btnW }]}>
+            <PressScale disabled={!loaded} onPress={onGarage} wrapStyle={styles.homeSmallWrap} style={styles.homeSmall}>
+              <Text style={styles.homeSmallTxt}>GARAGE</Text>
+            </PressScale>
+            <PressScale onPress={() => setModal('settings')} wrapStyle={styles.homeSmallWrap} style={styles.homeSmall}>
+              <Text style={styles.homeSmallTxt}>SETTINGS</Text>
+            </PressScale>
+            <PressScale onPress={() => setModal('about')} wrapStyle={styles.homeSmallWrap} style={styles.homeSmall}>
+              <Text style={styles.homeSmallTxt}>ABOUT</Text>
+            </PressScale>
+          </View>
+          <Text style={styles.homeBest}>BEST SCORE  {fmt(save.best)}</Text>
+        </View>
+      </Animated.View>
+
+      {modal === 'settings' && (
+        <View style={styles.overlay}>
+          <View style={styles.modalCard}>
+            <Text style={styles.setTitle}>SETTINGS</Text>
+            <View style={styles.setRow}>
+              <Text style={styles.setLabel}>Tilt sensitivity</Text>
+              <Seg opts={[['low', 'Low'], ['med', 'Medium'], ['high', 'High']]} value={stg.sens} onChange={(k) => setSetting('sens', k)} />
+            </View>
+            <View style={styles.setRow}>
+              <Text style={styles.setLabel}>Invert steering</Text>
+              <Seg opts={[[false, 'Off'], [true, 'On']]} value={!!stg.invert} onChange={(k) => setSetting('invert', k)} />
+            </View>
+            <Text style={[styles.setTitle, { marginTop: 10 }]}>SOUND</Text>
+            <View style={styles.setRow}>
+              <Text style={styles.setLabel}>All sound</Text>
+              <Seg opts={[[true, 'On'], [false, 'Off']]} value={stg.sound !== false} onChange={(k) => setSetting('sound', k)} />
+            </View>
+            <View style={[styles.setRow, stg.sound === false && { opacity: 0.45 }]}>
+              <Text style={styles.setLabel}>Music</Text>
+              <Seg opts={[[true, 'On'], [false, 'Off']]} value={stg.music !== false} onChange={(k) => setSetting('music', k)} />
+            </View>
+            <View style={[styles.setRow, stg.sound === false && { opacity: 0.45 }]}>
+              <Text style={styles.setLabel}>Engine sound</Text>
+              <Seg opts={[[true, 'On'], [false, 'Off']]} value={stg.engine !== false} onChange={(k) => setSetting('engine', k)} />
+            </View>
+            <View style={[styles.setRow, stg.sound === false && { opacity: 0.45 }]}>
+              <Text style={styles.setLabel}>Effects (crash, coins...)</Text>
+              <Seg opts={[[true, 'On'], [false, 'Off']]} value={stg.sfx !== false} onChange={(k) => setSetting('sfx', k)} />
+            </View>
+            <View style={styles.setRow}>
+              <Text style={styles.setLabel}>Challenge voice</Text>
+              <Seg opts={[[true, 'On'], [false, 'Off']]} value={stg.voice !== false} onChange={(k) => setSetting('voice', k)} />
+            </View>
+            <Text style={styles.setHint}>
+              Tilt your phone like a steering wheel. Tap the screen to turn boost on/off, swipe down to brake. The angle you hold when you press START is "straight".
+            </Text>
+            <PressScale onPress={() => setModal(null)} style={[styles.mainBtn, { backgroundColor: C.accent, marginTop: 16 }]}>
+              <Text style={styles.mainBtnText}>CLOSE</Text>
+            </PressScale>
+          </View>
+        </View>
+      )}
+
+      {modal === 'about' && (
+        <View style={styles.overlay}>
+          <View style={styles.modalCard}>
+            <View style={{ alignItems: 'center' }}>
+              <BrandMark width={Math.min(260, width * 0.7)} />
+            </View>
+            <Text style={styles.aboutVer}>VERSION {APP_VERSION}</Text>
+            <Text style={styles.aboutTxt}>
+              GOT RIDER is an endless 3D traffic racer. Weave through highway traffic on bikes and cars, pull off near misses, complete missions and unlock new rides. {TAGLINE}.
+            </Text>
+            <Text style={styles.aboutTxt}>Free to play, works offline, no ads. Your progress is saved on your device.</Text>
+            <PressScale onPress={() => setModal(null)} style={[styles.mainBtn, { backgroundColor: C.accent, marginTop: 16 }]}>
+              <Text style={styles.mainBtnText}>CLOSE</Text>
+            </PressScale>
+          </View>
+        </View>
+      )}
+    </View>
+  );
+}
+
 export default function App() {
   const [screen, setScreen] = useState('home'); // home | garage | play | over
   const [save, setSave] = useState(DEFAULT_SAVE);
@@ -1052,6 +1375,8 @@ export default function App() {
   const [notice, setNotice] = useState(null);
   const [ready, setReady] = useState(false);
   const [filter, setFilter] = useState('all');
+  const [tab, setTab] = useState('cars'); // cars | missions | settings
+  const [showSplash, setShowSplash] = useState(true); // cinematic GOT RIDER intro, once per launch
 
   const saveRef = useRef(save);
   saveRef.current = save;
@@ -1104,6 +1429,23 @@ export default function App() {
   }, [save, loaded]);
 
   const setSetting = (k, val) => setSave((p) => ({ ...p, settings: { ...p.settings, [k]: val } }));
+
+  // ---------- sound ----------
+  useEffect(() => {
+    Sound.init();
+    const sub = AppState.addEventListener('change', (st) => Sound.suspend(st !== 'active'));
+    return () => {
+      if (sub && sub.remove) sub.remove();
+    };
+  }, []);
+  useEffect(() => {
+    Sound.configure(save.settings);
+    // music: menu me normal, race me halka, READY/PAUSE par thoda aur halka
+    Sound.music(true, screen === 'play' ? (ready || paused ? 0.25 : 0.14) : 0.35);
+  }, [save.settings, screen, ready, paused]);
+  useEffect(() => {
+    if (screen !== 'play') Sound.engineStop();
+  }, [screen]);
 
   // ---------- tilt sensor ----------
   const wantTilt = loaded;
@@ -1372,14 +1714,16 @@ export default function App() {
 
     const finish = () => {
       alive.current = false;
+      Sound.engineStop();
       try {
         Speech.stop();
       } catch (e) {
         // ignore
       }
       const sv = saveRef.current;
-      const score = Math.floor(s.score);
-      const earned = Math.floor(s.credits);
+      const hz = s.hazard ? 1.25 : 1;
+      const score = Math.floor(s.score * hz);
+      const earned = Math.floor(s.credits * hz);
       const lvBefore = levelFromXp(sv.xp);
       const lvAfter = levelFromXp(sv.xp + score);
       let levelBonus = 0;
@@ -1420,6 +1764,7 @@ export default function App() {
         chText: chDef.label(ch.target),
         chOk,
         chBonus,
+        hazard: !!s.hazard,
       });
       setSave((p) => ({
         ...p,
@@ -1433,6 +1778,8 @@ export default function App() {
         challenge: chOk ? makeChallenge(chDoneCount) : { ...ch, best: Math.max(ch.best || 0, chVal) },
         challengesDone: chDoneCount,
       }));
+      if (s.chDone || chOk || score > sv.best) Sound.sfx('win');
+      else if (ms.completed.length) Sound.sfx('levelup');
       setScreen('over');
     };
     finishRef.current = finish;
@@ -1442,14 +1789,91 @@ export default function App() {
       s.bannerT = secs;
     };
     const chDef = CHALLENGES.find((d) => d.id === s.ch.id) || CHALLENGES[0];
-    const taunt = (t) => {
-      say(t.en, 2.2);
+    const speak = (hi, pitch, rate, queue) => {
       if (!s.voice) return;
       try {
-        Speech.stop();
-        Speech.speak(t.hi, { language: 'hi-IN', pitch: 0.8, rate: 0.95 });
+        if (!queue) Speech.stop();
+        Speech.speak(hi, { language: 'hi-IN', pitch, rate });
       } catch (e) {
         // voice na chale to sirf text dikhega
+      }
+    };
+    const taunt = (t) => {
+      say(t.en, 2.2);
+      speak(t.hi, 0.8, 0.95, false);
+    };
+
+    // ---- rider gir jata hai aur health bachi ho to wapas baith jata hai (bike / cycle) ----
+    let fall = null;
+    const startFall = () => {
+      if (!rider || fall) return;
+      player.remove(rider);
+      scene.add(rider);
+      rider.position.set(player.position.x, 0, 0);
+      rider.rotation.set(player.rotation.x, player.rotation.y, player.rotation.z);
+      fall = {
+        t: 0,
+        phase: 'air',
+        vx: (Math.random() < 0.5 ? -1 : 1) * rand(2, 4),
+        vy: rand(5.5, 7.5),
+        vz: -rand(3, 6),
+        sx: rand(6, 10),
+        sz: (Math.random() < 0.5 ? -1 : 1) * rand(3, 6),
+        side: Math.random() < 0.5 ? -1 : 1,
+        ground: false,
+      };
+    };
+    const wrapPi = (a) => a - Math.round(a / (2 * Math.PI)) * 2 * Math.PI;
+    const updateFall = (dt) => {
+      if (!fall) return;
+      const f = fall;
+      f.t += dt;
+      if (f.phase !== 'mount') {
+        f.vy -= 18 * dt;
+        rider.position.x += f.vx * dt;
+        rider.position.y += f.vy * dt;
+        rider.position.z += f.vz * dt;
+        f.vz += (s.speed * 0.8 - f.vz) * Math.min(1, dt * (f.ground ? 3 : 0.8));
+        f.vx *= 1 - Math.min(1, dt * (f.ground ? 3 : 0.3));
+        if (rider.position.y <= 0.3) {
+          rider.position.y = 0.3;
+          if (!f.ground) {
+            f.ground = true;
+            Sound.sfx('thud', 0.9);
+          }
+          f.vy = f.vy < -3 ? -f.vy * 0.25 : 0;
+        }
+        if (!f.ground) {
+          rider.rotation.x += f.sx * dt;
+          rider.rotation.z += f.sz * dt;
+        } else {
+          const k = Math.min(1, dt * 8);
+          const tx = Math.round(rider.rotation.x / (2 * Math.PI)) * 2 * Math.PI;
+          const tz = Math.round((rider.rotation.z - f.side * Math.PI / 2) / (2 * Math.PI)) * 2 * Math.PI + (f.side * Math.PI) / 2;
+          rider.rotation.x += (tx - rider.rotation.x) * k;
+          rider.rotation.z += (tz - rider.rotation.z) * k;
+        }
+        if (f.t > 1.7) {
+          f.phase = 'mount';
+          f.u = 0;
+          f.m0 = { x: rider.position.x, y: rider.position.y, z: rider.position.z, rx: wrapPi(rider.rotation.x), rz: wrapPi(rider.rotation.z) };
+        }
+      } else {
+        f.u = Math.min(1, f.u + dt / 0.6);
+        const e = f.u * f.u * (3 - 2 * f.u);
+        rider.position.x = f.m0.x + (player.position.x - f.m0.x) * e;
+        rider.position.y = f.m0.y * (1 - e) + Math.sin(Math.PI * f.u) * 0.9;
+        rider.position.z = f.m0.z * (1 - e);
+        rider.rotation.x = f.m0.rx * (1 - e);
+        rider.rotation.z = f.m0.rz * (1 - e);
+        rider.rotation.y = 0;
+        if (f.u >= 1) {
+          scene.remove(rider);
+          player.add(rider);
+          rider.position.set(0, 0, 0);
+          rider.rotation.set(0, 0, 0);
+          fall = null;
+        }
       }
     };
 
@@ -1469,6 +1893,7 @@ export default function App() {
         s.toggleBoost = false;
         s.boostOn = !s.boostOn;
         say(s.boostOn ? 'BOOST ON' : 'BOOST OFF', 0.9);
+        if (s.boostOn) Sound.sfx('boost', 0.8);
       }
       s.age += dt;
       if (s.brakeT > 0) s.brakeT -= dt;
@@ -1557,6 +1982,7 @@ export default function App() {
         if (rider) rider.visible = !fpv;
       }
       player.visible = blink && !(fpv && V.kind === 'car');
+      updateFall(dt);
       for (let i = 0; i < pWheels.length; i++) pWheels[i].node.rotation.x -= (s.speed * dt) / pWheels[i].r;
       wheelGrp.rotation.z = -steer * 1.3;
 
@@ -1584,6 +2010,7 @@ export default function App() {
         s.level = lvl;
         const nv = VEHICLES.find((x) => x.level === lvl && !saveRef.current.owned[x.id]);
         say(nv ? `LEVEL ${lvl}!  New ride: ${nv.name}` : `LEVEL UP!  Level ${lvl}`, 2.4);
+        Sound.sfx('levelup');
       }
 
       // unlock target
@@ -1591,6 +2018,7 @@ export default function App() {
         s.goalDone = true;
         s.credits += s.goal.reward;
         say(`TARGET DONE  +${fmt(s.goal.reward)}`, 2.6);
+        Sound.sfx('win');
       }
 
       // impossible challenge: taunt voice + live check
@@ -1603,6 +2031,7 @@ export default function App() {
         if (chDef.live(s) >= s.ch.target) {
           s.chDone = true;
           say('CHALLENGE DONE!', 2.6);
+          Sound.sfx('win');
           taunt(WIN_TAUNT);
         }
       }
@@ -1624,6 +2053,7 @@ export default function App() {
             if (s.traffic.some((c) => c.lane === lane && Math.abs(c.z - spawnZ) < 30)) continue;
             used.push(lane);
             const type = pickType(s.level);
+            if (type === 'police' || type === 'ambulance') Sound.sfx('siren', 0.4);
             const info = TRAFFIC[type];
             const model = makeTraffic(type, TRAFFIC_COLORS[Math.floor(Math.random() * TRAFFIC_COLORS.length)]);
             model.rotation.y = lane < 2 ? Math.PI : 0;
@@ -1632,7 +2062,40 @@ export default function App() {
             pivot.position.set(laneX(lane), 0, spawnZ);
             scene.add(pivot);
             const lt = LANE_TRAFFIC[lane];
-            s.traffic.push({ lane, z: spawnZ, prevZ: spawnZ, obj: pivot, wheels: model.userData.wheels, half: info.len / 2, hw: info.hw, tv: lt.tv, frac: lt.frac, nm: false, dead: false });
+            s.traffic.push({
+              lane,
+              z: spawnZ,
+              prevZ: spawnZ,
+              obj: pivot,
+              wheels: model.userData.wheels,
+              half: info.len / 2,
+              hw: info.hw,
+              tv: lt.tv !== undefined ? lt.tv + (info.dtv || 0) : undefined,
+              frac: lt.frac !== undefined ? clamp(lt.frac + (info.dfrac || 0), 0.15, 0.97) : undefined,
+              flash: model.userData.flash || null,
+              emg: type === 'police' || type === 'ambulance',
+              dmgK: 1,
+              soft: false,
+              nm: false,
+              dead: false,
+            });
+          }
+        }
+        // road obstacles: cones and work barriers stand still on the road
+        if (s.hazard && s.level >= 2 && Math.random() < Math.min(0.4, 0.14 + s.level * 0.008)) {
+          const lanes = [0, 1, 2, 3].filter((i) => used.indexOf(i) < 0 && !s.traffic.some((c) => c.lane === i && Math.abs(c.z - spawnZ) < 45));
+          if (lanes.length) {
+            const lane = lanes[Math.floor(Math.random() * lanes.length)];
+            const type = Math.random() < 0.6 ? 'cones' : 'barrier';
+            const info = TRAFFIC[type];
+            const model = makeTraffic(type, '#f97316');
+            const pivot = new THREE.Group();
+            pivot.add(model);
+            pivot.position.set(laneX(lane), 0, spawnZ);
+            scene.add(pivot);
+            used.push(lane);
+            s.traffic.push({ lane, z: spawnZ, prevZ: spawnZ, obj: pivot, wheels: [], half: info.len / 2, hw: info.hw, tv: 0, frac: 0, flash: model.userData.flash || null, dmgK: info.dmgK, soft: !!info.soft, nm: false, dead: false });
+            if (type === 'barrier' && s.bannerT <= 0) say('ROAD WORK AHEAD!', 1.3);
           }
         }
         if (Math.random() < 0.55) {
@@ -1668,11 +2131,16 @@ export default function App() {
         c.z += dz * dt;
         c.obj.position.z = c.z;
         for (let j = 0; j < c.wheels.length; j++) c.wheels[j].node.rotation.x -= (dz * dt) / c.wheels[j].r;
+        if (c.flash) {
+          const ph = Math.floor(now / 180) % 2;
+          c.flash[0].visible = ph === 0;
+          c.flash[1].visible = ph === 1;
+        }
         const cx = laneX(c.lane);
         const dx = Math.abs(cx - s.x);
         if (dx < c.hw + V.hw - 0.1 && Math.abs(c.z) < c.half + V.len / 2) {
           if (s.invuln <= 0) {
-            const dmg = Math.min(70, (12 + dz * 0.9) * V.armor);
+            const dmg = Math.min(70, (12 + dz * 0.9) * V.armor * (c.dmgK || 1));
             s.hp -= dmg;
             s.invuln = 1.6;
             s.slowT = 1.2;
@@ -1683,10 +2151,21 @@ export default function App() {
             c.dead = true;
             say(`CRASH  -${Math.round(dmg)}`, 1.2);
             buzz('crash');
+            if (c.soft) {
+              Sound.sfx('thud', 0.9);
+            } else {
+              Sound.sfx('screech', 0.8);
+              setTimeout(() => {
+                Sound.sfx('crash');
+                Sound.sfx('gasp', 0.8);
+              }, 170);
+              startFall();
+              speak(CROWD[Math.floor(Math.random() * CROWD.length)], 1.25, 1.05, false);
+            }
             s.crashes += 1;
             if (s.chOn && !s.chDone) {
               s.tauntT = 99;
-              taunt(CRASH_TAUNT);
+              speak(CRASH_TAUNT.hi, 0.8, 0.95, true);
             }
           }
         } else if (!c.nm && c.prevZ < 0 && c.z >= 0 && dx > 1.0 && dx < 3.6) {
@@ -1697,7 +2176,13 @@ export default function App() {
           s.score += 25 * s.combo;
           s.credits += 3;
           say(`NEAR MISS  x${s.combo}`, 0.9);
+          if (c.emg) {
+            s.score += 100;
+            s.credits += 10;
+            say('EMERGENCY NEAR MISS  +100', 1.3);
+          }
           buzz('near');
+          Sound.sfx('near', 0.6);
         }
       }
 
@@ -1712,9 +2197,11 @@ export default function App() {
           if (p.heal) {
             s.hp = Math.min(100, s.hp + 25);
             say('REPAIR  +25 HP', 1.1);
+            Sound.sfx('heal');
           } else {
             s.credits += 10;
             s.coinN += 1;
+            Sound.sfx('coin', 0.5);
           }
         }
       }
@@ -1795,6 +2282,7 @@ export default function App() {
       hudTimer += dt;
       if (hudTimer > 0.1) {
         hudTimer = 0;
+        Sound.engineUpdate(Math.abs(s.speed) / (V.maxKmh * KMH), s.boostOn);
         const lpNow = levelProgress(saveRef.current.xp + s.score);
         setHud({
           kmh: Math.round(kmh),
@@ -1924,7 +2412,8 @@ export default function App() {
       maxCombo: 0,
       coinN: 0,
       crashes: 0,
-      voice: st.voice !== false,
+      voice: st.voice !== false && st.sound !== false,
+      hazard: st.mode === 'hazard',
       ch: saveRef.current.challenge || makeChallenge(0),
       chOn: true,
       chDone: false,
@@ -1956,10 +2445,17 @@ export default function App() {
   const v = VEHICLES.find((x) => x.id === sel);
 
   const drive = () => {
+    Sound.sfx('click');
     setSave((p) => ({ ...p, selected: v.id }));
     startRun(v.id);
   };
+  // main menu PLAY: ride the selected vehicle straight away (falls back to the garage if it is not owned)
+  const quickPlay = () => {
+    if (owned) drive();
+    else setScreen('garage');
+  };
   const buy = () => {
+    Sound.sfx('coin');
     setSave((p) => ({ ...p, credits: p.credits - v.price, owned: { ...p.owned, [v.id]: true }, selected: v.id }));
   };
 
@@ -1967,6 +2463,7 @@ export default function App() {
     pausedRef.current = on;
     setPaused(on);
     if (on) {
+      Sound.engineStop();
       try {
         Speech.stop();
       } catch (e) {
@@ -1976,6 +2473,9 @@ export default function App() {
   };
 
   const startNow = () => {
+    if (gameRef.current) gameRef.current.hazard = saveRef.current.settings.mode === 'hazard';
+    Sound.sfx('start');
+    Sound.engineStart(Sound.engineKeyFor(vehicleRef.current.id));
     recenter();
     pausedRef.current = false;
     setReady(false);
@@ -1993,21 +2493,8 @@ export default function App() {
   if (screen === 'home') {
     return (
       <View style={styles.root}>
-        <StatusBar barStyle="light-content" />
-        <View style={styles.homeWrap}>
-          <View style={styles.homeRoad} pointerEvents="none">
-            {[0, 1, 2, 3, 4, 5].map((i) => (
-              <View key={i} style={[styles.homeDash, { top: 10 + i * 70 }]} />
-            ))}
-          </View>
-          <Text style={styles.homeKicker}>NODERRA</Text>
-          <Text style={styles.homeTitle}>RUSH</Text>
-          <Text style={styles.homeSub}>TRAFFIC RACER 3D</Text>
-          <Pressable disabled={!loaded} onPress={() => setScreen('garage')} style={[styles.startBtn, !loaded && { opacity: 0.5 }]}>
-            <Text style={styles.startBtnText}>START</Text>
-          </Pressable>
-          <Text style={styles.homeBest}>BEST SCORE  {fmt(save.best)}</Text>
-        </View>
+        <HomeScreen save={save} loaded={loaded} vehicleName={v ? v.name : 'City Cycle'} onPlay={quickPlay} onGarage={() => setScreen('garage')} setSetting={setSetting} />
+        {showSplash && <SplashIntro ready={loaded} onDone={() => setShowSplash(false)} />}
       </View>
     );
   }
@@ -2037,158 +2524,240 @@ export default function App() {
     const topSpd = Math.round(boostTopFor(v));
     const ch = save.challenge || makeChallenge(0);
     const chD = CHALLENGES.find((d) => d.id === ch.id) || CHALLENGES[0];
+    const idx = VEHICLES.findIndex((x) => x.id === sel);
+    const go = (d) => {
+      Sound.sfx('click', 0.6);
+      setSel(VEHICLES[(idx + d + VEHICLES.length) % VEHICLES.length].id);
+    };
+    const nextV = VEHICLES.find((x) => !save.owned[x.id] && x.level > playerLevel);
+    const doneCount = VEHICLES.filter((x) => (save.goals || {})[x.id]).length;
 
     return (
       <View style={styles.root}>
         <StatusBar barStyle="light-content" />
-        <ScrollView contentContainerStyle={styles.garageScroll} showsVerticalScrollIndicator={false}>
+        <View style={styles.gTop}>
           <View style={styles.topRow}>
             <View>
-              <Text style={styles.brand}>NODERRA RUSH</Text>
-              <Text style={styles.brandSub}>GARAGE</Text>
+              <Text style={styles.brand}>
+                <Text style={{ color: C.accent }}>GOT </Text>RIDER
+              </Text>
+              <Text style={styles.rankText}>
+                LV {lp.level}  •  {rankFor(lp.level).toUpperCase()}
+              </Text>
             </View>
             <View style={styles.pill}>
               <View style={styles.coinDot} />
               <Text style={styles.pillText}>{fmt(save.credits)}</Text>
             </View>
           </View>
-
-          <View style={styles.levelBox}>
-            <View style={styles.levelRow}>
-              <Text style={styles.levelText}>
-                LEVEL {lp.level}  •  {rankFor(lp.level).toUpperCase()}
-              </Text>
-              <Text style={styles.levelSub}>
-                {fmt(lp.into)} / {fmt(lp.need)} XP
-              </Text>
-            </View>
-            <View style={styles.barBg}>
-              <View style={[styles.barFill, { width: `${Math.min(100, lp.pct * 100)}%`, backgroundColor: C.cyan }]} />
-            </View>
+          <View style={[styles.barBg, { marginTop: 10 }]}>
+            <View style={[styles.barFill, { width: `${Math.min(100, lp.pct * 100)}%`, backgroundColor: C.cyan }]} />
           </View>
-
-          <View style={styles.previewBox}>
-            <GaragePreview vehicleId={sel} />
-            <View style={styles.previewLabel} pointerEvents="none">
-              <Text style={styles.vTag}>{v.tag}</Text>
-              <Text style={styles.vName}>{v.name}</Text>
-            </View>
-            <View style={styles.speedBadge} pointerEvents="none">
-              <Text style={styles.speedBadgeNum}>{topSpd}</Text>
-              <Text style={styles.speedBadgeUnit}>KM/H TOP</Text>
-            </View>
-            {!owned && (
-              <View style={styles.lockBadge} pointerEvents="none">
-                <Text style={styles.lockBadgeText}>{playerLevel < v.level ? `LOCKED  LV ${v.level}` : 'FOR SALE'}</Text>
-              </View>
-            )}
-          </View>
-
-          <View style={styles.statsBox}>
-            <StatBar label="SPEED" value={v.stars.s} />
-            <StatBar label="HANDLING" value={v.stars.h} />
-            <StatBar label="ARMOR" value={v.stars.a} />
-          </View>
-
-          {v.kind === 'car' && <Text style={styles.carNote}>CAR MODE: the screen turns landscape. GAS, BRAKE, REVERSE and BOOST are on-screen pads; tilt to steer.</Text>}
-
-          <View style={[styles.goalBox, goalDoneV && { borderColor: C.good }]}>
-            <Text style={[styles.goalTitle, goalDoneV && { color: C.good }]}>{goalDoneV ? 'VEHICLE TARGET COMPLETE' : 'VEHICLE TARGET'}</Text>
-            <Text style={styles.goalText}>
-              In ONE run reach {goal.kmh} km/h and make {goal.near} near misses{'\n'}
-              Reward: +{fmt(goal.reward)} credits{owned ? '' : '  (unlock the vehicle first)'}
-            </Text>
-          </View>
-
-          <View style={styles.chipRow}>
-            {[['all', 'ALL'], ['bike', 'BIKES'], ['car', 'CARS']].map(([k, l]) => (
-              <Pressable key={k} onPress={() => setFilter(k)} style={[styles.chip, filter === k && styles.chipOn]}>
-                <Text style={[styles.chipTxt, filter === k && { color: '#111827' }]}>{l}</Text>
-              </Pressable>
-            ))}
-          </View>
-
-          <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.tiles}>
-            {list.map((x) => {
-              const isOwned = !!save.owned[x.id];
-              const locked = !isOwned && playerLevel < x.level;
-              const status = isOwned ? (save.selected === x.id ? 'SELECTED' : 'OWNED') : locked ? `LV ${x.level}` : fmt(x.price);
-              return (
-                <Pressable key={x.id} onPress={() => setSel(x.id)} style={[styles.tile, sel === x.id && styles.tileOn, locked && { opacity: 0.6 }]}>
-                  <View style={[styles.tileDot, { backgroundColor: x.color }]} />
-                  <Text style={styles.tileName} numberOfLines={1}>
-                    {x.name}
-                  </Text>
-                  <Text style={styles.tileTag} numberOfLines={1}>
-                    {x.tag}
-                  </Text>
-                  <Text style={[styles.tileStatus, isOwned && { color: C.good }, locked && { color: C.muted }]}>{status}</Text>
-                </Pressable>
-              );
-            })}
-          </ScrollView>
-
-          <View style={styles.chBox}>
-            <View style={styles.missionHead}>
-              <Text style={styles.chTitle}>IMPOSSIBLE CHALLENGE</Text>
-              <Text style={styles.levelSub}>{save.challengesDone || 0} beaten</Text>
-            </View>
-            <Text style={styles.missionTxt}>{chD.label(ch.target)}</Text>
-            <Text style={styles.chHint}>Reward +{fmt(ch.reward)} credits. A voice will mock you during the run...</Text>
-          </View>
-
-          <View style={styles.missionBox}>
-            <View style={styles.missionHead}>
-              <Text style={styles.setTitle}>MISSIONS</Text>
-              <Text style={styles.levelSub}>{save.missionsDone || 0} completed</Text>
-            </View>
-            {(save.missions || []).map((m) => {
-              const def = MISSION_DEFS.find((d) => d.type === m.type);
-              if (!def) return null;
-              const pct = Math.min(1, m.progress / m.target);
-              return (
-                <View key={m.id} style={styles.missionRow}>
-                  <View style={{ flex: 1, marginRight: 10 }}>
-                    <Text style={styles.missionTxt}>{def.label(m.target)}</Text>
-                    <View style={styles.barBg}>
-                      <View style={[styles.barFill, { width: `${pct * 100}%`, backgroundColor: C.gold }]} />
-                    </View>
-                  </View>
-                  <Text style={styles.missionReward}>+{fmt(m.reward)}</Text>
-                </View>
-              );
-            })}
-          </View>
-
-          <View style={styles.setBox}>
-            <Text style={styles.setTitle}>SETTINGS</Text>
-            <View style={styles.setRow}>
-              <Text style={styles.setLabel}>Tilt sensitivity</Text>
-              <Seg opts={[['low', 'Low'], ['med', 'Medium'], ['high', 'High']]} value={stg.sens} onChange={(k) => setSetting('sens', k)} />
-            </View>
-            <View style={styles.setRow}>
-              <Text style={styles.setLabel}>Invert steering</Text>
-              <Seg opts={[[false, 'Off'], [true, 'On']]} value={!!stg.invert} onChange={(k) => setSetting('invert', k)} />
-            </View>
-            <View style={styles.setRow}>
-              <Text style={styles.setLabel}>Challenge voice</Text>
-              <Seg opts={[[true, 'On'], [false, 'Off']]} value={stg.voice !== false} onChange={(k) => setSetting('voice', k)} />
-            </View>
-            {notice && <Text style={styles.notice}>{notice}</Text>}
-            <Text style={styles.setHint}>
-              Tilt your phone like a steering wheel. Tap the screen to turn boost on/off, swipe down to brake. The angle you hold when you press START is "straight".
-            </Text>
-          </View>
-
-          <Text style={styles.footer}>BEST SCORE  {fmt(save.best)}   •   RUNS  {fmt(save.runs || 0)}</Text>
-          <Text style={styles.howto}>The left half of the road is oncoming traffic: score x2, but much riskier.</Text>
-        </ScrollView>
-
-        <View style={styles.bottomBar}>
-          <Pressable disabled={!onPress} onPress={onPress || undefined} style={[styles.mainBtn, { backgroundColor: tone, marginTop: 0 }, !onPress && { opacity: 0.85 }]}>
-            <Text style={[styles.mainBtnText, !onPress && { color: C.muted }]}>{label}</Text>
-          </Pressable>
+          <Text style={styles.xpLine}>
+            {fmt(lp.into)} / {fmt(lp.need)} XP to next level
+          </Text>
         </View>
+
+        <View style={styles.tabsBar}>
+          {[['cars', 'GARAGE'], ['missions', 'MISSIONS'], ['settings', 'SETTINGS']].map(([k, t]) => (
+            <Pressable key={k} onPress={() => setTab(k)} style={[styles.tabBtn, tab === k && styles.tabBtnOn]}>
+              <Text style={[styles.tabBtnTxt, tab === k && { color: '#111827' }]}>{t}</Text>
+            </Pressable>
+          ))}
+        </View>
+
+        {tab === 'cars' && (
+          <>
+            <ScrollView contentContainerStyle={styles.tabScroll} showsVerticalScrollIndicator={false}>
+              <View style={styles.previewBox}>
+                <GaragePreview vehicleId={sel} />
+                <View style={styles.previewLabel} pointerEvents="none">
+                  <Text style={styles.vTag}>{v.tag}</Text>
+                  <Text style={styles.vName}>{v.name}</Text>
+                </View>
+                <View style={styles.speedBadge} pointerEvents="none">
+                  <Text style={styles.speedBadgeNum}>{topSpd}</Text>
+                  <Text style={styles.speedBadgeUnit}>KM/H TOP</Text>
+                </View>
+                <View style={styles.lockBadge} pointerEvents="none">
+                  <Text style={[styles.lockBadgeText, owned && { color: C.good }]}>
+                    {owned ? 'OWNED' : playerLevel < v.level ? `LOCKED  LV ${v.level}` : 'FOR SALE'}
+                  </Text>
+                </View>
+                <Pressable onPress={() => go(-1)} style={[styles.arrow, { left: 8 }]}>
+                  <Text style={styles.arrowTxt}>‹</Text>
+                </Pressable>
+                <Pressable onPress={() => go(1)} style={[styles.arrow, { right: 8 }]}>
+                  <Text style={styles.arrowTxt}>›</Text>
+                </Pressable>
+                <Text style={styles.counter} pointerEvents="none">
+                  {idx + 1} / {VEHICLES.length}
+                </Text>
+              </View>
+
+              <View style={styles.infoChips}>
+                <Text style={styles.infoChip}>{v.kind === 'car' ? 'CAR  •  LANDSCAPE' : v.kind === 'bike' ? 'BIKE' : 'CYCLE'}</Text>
+                <Text style={styles.infoChip}>TOP {topSpd} KM/H</Text>
+                <Text style={styles.infoChip}>LV {v.level}</Text>
+              </View>
+
+              <View style={styles.statsBox}>
+                <StatBar label="SPEED" value={v.stars.s} />
+                <StatBar label="HANDLING" value={v.stars.h} />
+                <StatBar label="ARMOR" value={v.stars.a} />
+              </View>
+
+              {v.kind === 'car' && <Text style={styles.carNote}>CAR MODE: the screen turns landscape. GAS, BRAKE, REVERSE and BOOST are on-screen pads; tilt to steer.</Text>}
+
+              <View style={styles.modeBox}>
+                <Text style={styles.setTitle}>GAME MODE</Text>
+                <Seg opts={[['classic', 'Classic'], ['hazard', 'Hazard']]} value={stg.mode === 'hazard' ? 'hazard' : 'classic'} onChange={(k) => setSetting('mode', k)} />
+                <Text style={styles.setHint}>
+                  {stg.mode === 'hazard' ? 'HAZARD: traffic plus road cones and work barriers. Score and credits x1.25.' : 'CLASSIC: traffic only, no road obstacles.'}
+                </Text>
+              </View>
+
+              <View style={[styles.goalBox, goalDoneV && { borderColor: C.good }]}>
+                <Text style={[styles.goalTitle, goalDoneV && { color: C.good }]}>{goalDoneV ? 'VEHICLE TARGET COMPLETE' : 'VEHICLE TARGET'}</Text>
+                <Text style={styles.goalText}>
+                  In ONE run reach {goal.kmh} km/h and make {goal.near} near misses{'\n'}
+                  Reward: +{fmt(goal.reward)} credits{owned ? '' : '  (unlock the vehicle first)'}
+                </Text>
+              </View>
+
+              <Text style={styles.sectionTitle}>ALL VEHICLES</Text>
+              <View style={styles.chipRow}>
+                {[['all', 'ALL'], ['bike', 'BIKES'], ['car', 'CARS']].map(([k, l]) => (
+                  <Pressable key={k} onPress={() => setFilter(k)} style={[styles.chip, filter === k && styles.chipOn]}>
+                    <Text style={[styles.chipTxt, filter === k && { color: '#111827' }]}>{l}</Text>
+                  </Pressable>
+                ))}
+              </View>
+              <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.tiles}>
+                {list.map((x) => {
+                  const isOwned = !!save.owned[x.id];
+                  const locked = !isOwned && playerLevel < x.level;
+                  const status = isOwned ? (save.selected === x.id ? 'SELECTED' : 'OWNED') : locked ? `LV ${x.level}` : fmt(x.price);
+                  return (
+                    <Pressable key={x.id} onPress={() => setSel(x.id)} style={[styles.tile, sel === x.id && styles.tileOn, locked && { opacity: 0.6 }]}>
+                      <View style={[styles.tileDot, { backgroundColor: x.color }]} />
+                      <Text style={styles.tileName} numberOfLines={1}>
+                        {x.name}
+                      </Text>
+                      <Text style={styles.tileTag} numberOfLines={1}>
+                        {x.tag}
+                      </Text>
+                      <Text style={[styles.tileStatus, isOwned && { color: C.good }, locked && { color: C.muted }]}>{status}</Text>
+                    </Pressable>
+                  );
+                })}
+              </ScrollView>
+              <Text style={styles.howto}>
+                Targets complete: {doneCount} / {VEHICLES.length}
+                {nextV ? `\nNext unlock: ${nextV.name} (Level ${nextV.level})` : ''}
+              </Text>
+            </ScrollView>
+            <View style={styles.bottomBar}>
+              <Pressable disabled={!onPress} onPress={onPress || undefined} style={[styles.mainBtn, { backgroundColor: tone, marginTop: 0 }, !onPress && { opacity: 0.85 }]}>
+                <Text style={[styles.mainBtnText, !onPress && { color: C.muted }]}>{label}</Text>
+              </Pressable>
+            </View>
+          </>
+        )}
+
+        {tab === 'missions' && (
+          <ScrollView contentContainerStyle={[styles.tabScroll, { paddingBottom: 40 }]} showsVerticalScrollIndicator={false}>
+            <View style={styles.levelBox}>
+              <Text style={styles.levelText}>
+                RANK: {rankFor(lp.level).toUpperCase()}  •  LEVEL {lp.level}
+              </Text>
+              <Text style={[styles.levelSub, { marginTop: 4 }]}>{nextV ? `Next ride: ${nextV.name} (Level ${nextV.level})` : 'All vehicles unlocked! Now it is only levels and missions.'}</Text>
+            </View>
+
+            <View style={[styles.chBox, { marginTop: 12 }]}>
+              <View style={styles.missionHead}>
+                <Text style={styles.chTitle}>IMPOSSIBLE CHALLENGE</Text>
+                <Text style={styles.levelSub}>{save.challengesDone || 0} beaten</Text>
+              </View>
+              <Text style={styles.missionTxt}>{chD.label(ch.target)}</Text>
+              <Text style={styles.chHint}>Reward +{fmt(ch.reward)} credits. A voice will mock you during the run...</Text>
+            </View>
+
+            <View style={styles.missionBox}>
+              <View style={styles.missionHead}>
+                <Text style={styles.setTitle}>MISSIONS (endless)</Text>
+                <Text style={styles.levelSub}>{save.missionsDone || 0} completed</Text>
+              </View>
+              {(save.missions || []).map((m) => {
+                const def = MISSION_DEFS.find((d) => d.type === m.type);
+                if (!def) return null;
+                const pct = Math.min(1, m.progress / m.target);
+                return (
+                  <View key={m.id} style={styles.missionRow}>
+                    <View style={{ flex: 1, marginRight: 10 }}>
+                      <Text style={styles.missionTxt}>{def.label(m.target)}</Text>
+                      <View style={styles.barBg}>
+                        <View style={[styles.barFill, { width: `${pct * 100}%`, backgroundColor: C.gold }]} />
+                      </View>
+                    </View>
+                    <Text style={styles.missionReward}>+{fmt(m.reward)}</Text>
+                  </View>
+                );
+              })}
+            </View>
+            <Text style={styles.howto}>
+              Finish a mission and a new, harder one takes its place. Completed: {save.missionsDone || 0}  •  Best score: {fmt(save.best)}  •  Runs: {fmt(save.runs || 0)}
+            </Text>
+          </ScrollView>
+        )}
+
+        {tab === 'settings' && (
+          <ScrollView contentContainerStyle={[styles.tabScroll, { paddingBottom: 40 }]} showsVerticalScrollIndicator={false}>
+            <View style={styles.setBox}>
+              <Text style={styles.setTitle}>TILT STEERING</Text>
+              <View style={styles.setRow}>
+                <Text style={styles.setLabel}>Sensitivity</Text>
+                <Seg opts={[['low', 'Low'], ['med', 'Medium'], ['high', 'High']]} value={stg.sens} onChange={(k) => setSetting('sens', k)} />
+              </View>
+              <View style={styles.setRow}>
+                <Text style={styles.setLabel}>Invert steering</Text>
+                <Seg opts={[[false, 'Off'], [true, 'On']]} value={!!stg.invert} onChange={(k) => setSetting('invert', k)} />
+              </View>
+              <Text style={styles.setHint}>Tilt your phone like a steering wheel. The angle you hold when you press START is "straight". Low = you need a bigger tilt to turn.</Text>
+              {notice && <Text style={styles.notice}>{notice}</Text>}
+            </View>
+
+            <View style={[styles.setBox, { marginTop: 12 }]}>
+              <Text style={styles.setTitle}>SOUND</Text>
+              <View style={styles.setRow}>
+                <Text style={styles.setLabel}>All sound</Text>
+                <Seg opts={[[true, 'On'], [false, 'Off']]} value={stg.sound !== false} onChange={(k) => setSetting('sound', k)} />
+              </View>
+              <View style={[styles.setRow, stg.sound === false && { opacity: 0.45 }]}>
+                <Text style={styles.setLabel}>Music</Text>
+                <Seg opts={[[true, 'On'], [false, 'Off']]} value={stg.music !== false} onChange={(k) => setSetting('music', k)} />
+              </View>
+              <View style={[styles.setRow, stg.sound === false && { opacity: 0.45 }]}>
+                <Text style={styles.setLabel}>Engine sound</Text>
+                <Seg opts={[[true, 'On'], [false, 'Off']]} value={stg.engine !== false} onChange={(k) => setSetting('engine', k)} />
+              </View>
+              <View style={[styles.setRow, stg.sound === false && { opacity: 0.45 }]}>
+                <Text style={styles.setLabel}>Effects (crash, coins...)</Text>
+                <Seg opts={[[true, 'On'], [false, 'Off']]} value={stg.sfx !== false} onChange={(k) => setSetting('sfx', k)} />
+              </View>
+              <View style={styles.setRow}>
+                <Text style={styles.setLabel}>Challenge voice</Text>
+                <Seg opts={[[true, 'On'], [false, 'Off']]} value={stg.voice !== false} onChange={(k) => setSetting('voice', k)} />
+              </View>
+            </View>
+
+            <Text style={styles.howto}>
+              Bike / cycle: auto-accelerate. Tap the screen = boost on/off, swipe down = brake.{'\n'}
+              Car: landscape with GAS, BRAKE, REVERSE and BOOST pads.{'\n'}
+              The left half of the road is oncoming traffic: score x2, but much riskier.
+            </Text>
+          </ScrollView>
+        )}
       </View>
     );
   }
@@ -2199,10 +2768,12 @@ export default function App() {
       <View style={styles.root}>
         <StatusBar barStyle="light-content" />
         <ScrollView contentContainerStyle={styles.overScroll} showsVerticalScrollIndicator={false}>
+          <BrandMark width={130} style={{ marginBottom: 4 }} />
           <Text style={styles.overTitle}>RUN COMPLETE</Text>
           {result.newBest && <Text style={styles.newBest}>NEW BEST!</Text>}
           <Text style={styles.bigScore}>{fmt(result.score)}</Text>
           <Text style={styles.bigScoreSub}>SCORE</Text>
+          {result.hazard && <Text style={[styles.chHint, { textAlign: 'center', marginTop: -10, marginBottom: 12 }]}>HAZARD MODE BONUS x1.25 applied</Text>}
 
           <View style={styles.grid}>
             {[
@@ -2409,15 +2980,20 @@ export default function App() {
 
       {paused && (
         <View style={styles.overlay}>
+          <BrandMark width={140} />
           <Text style={styles.overTitle}>PAUSED</Text>
           <Pressable
             onPress={() => {
               recenter();
               togglePause(false);
+              Sound.engineStart(Sound.engineKeyFor(vehicleRef.current.id));
             }}
             style={[styles.mainBtn, { backgroundColor: C.accent, width: 240 }]}
           >
             <Text style={styles.mainBtnText}>RESUME</Text>
+          </Pressable>
+          <Pressable onPress={() => setSetting('sound', save.settings.sound === false)} style={[styles.mainBtn, styles.ghostBtn, { width: 240 }]}>
+            <Text style={[styles.mainBtnText, { color: C.text }]}>SOUND: {save.settings.sound === false ? 'OFF' : 'ON'}</Text>
           </Pressable>
           <Pressable
             onPress={() => {
@@ -2434,6 +3010,7 @@ export default function App() {
 
       {ready && !err && (
         <View style={styles.overlay}>
+          <BrandMark width={140} />
           <Text style={styles.readyKicker}>{vehicleRef.current.name.toUpperCase()}</Text>
           <Text style={styles.overTitle}>READY?</Text>
           <Text style={styles.readyHint}>
@@ -2441,8 +3018,14 @@ export default function App() {
               ? 'Use the LEFT / RIGHT buttons to steer. Tap START when you are ready.'
               : 'Hold your phone the way you want to drive. The angle you hold when you tap START becomes "straight".'}
           </Text>
+          <View style={{ alignItems: 'center', marginBottom: 14 }}>
+            <Seg opts={[['classic', 'Classic'], ['hazard', 'Hazard x1.25']]} value={save.settings.mode === 'hazard' ? 'hazard' : 'classic'} onChange={(k) => setSetting('mode', k)} />
+          </View>
           <Pressable onPress={startNow} style={[styles.startBtn, { width: 240 }]}>
             <Text style={styles.startBtnText}>START</Text>
+          </Pressable>
+          <Pressable onPress={() => setSetting('sound', save.settings.sound === false)} style={[styles.mainBtn, styles.ghostBtn, { width: 240 }]}>
+            <Text style={[styles.mainBtnText, { color: C.text }]}>SOUND: {save.settings.sound === false ? 'OFF' : 'ON'}</Text>
           </Pressable>
           <Pressable onPress={leaveToGarage} style={[styles.mainBtn, styles.ghostBtn, { width: 240 }]}>
             <Text style={[styles.mainBtnText, { color: C.text }]}>BACK TO GARAGE</Text>
@@ -2585,20 +3168,37 @@ const styles = StyleSheet.create({
   cdBg: { width: '70%', height: 3, borderRadius: 2, backgroundColor: 'rgba(255,255,255,0.2)', marginTop: 6, overflow: 'hidden' },
   cdFill: { height: 3, backgroundColor: C.cyan },
 
-  overlay: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(11,18,32,0.92)', alignItems: 'center', justifyContent: 'center', paddingHorizontal: 24 },
+  overlay: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(10,10,13,0.93)', alignItems: 'center', justifyContent: 'center', paddingHorizontal: 24 },
   errText: { color: C.text, fontSize: 14, textAlign: 'center', marginVertical: 14 },
 
-  homeWrap: { flex: 1, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 24 },
-  homeRoad: { position: 'absolute', top: 0, bottom: 0, left: '50%', width: 200, marginLeft: -100, backgroundColor: '#141c30' },
-  homeDash: { position: 'absolute', left: 97, width: 6, height: 36, borderRadius: 3, backgroundColor: '#fbbf24' },
-  homeKicker: { color: C.cyan, fontSize: 18, fontWeight: '900', letterSpacing: 10 },
-  homeTitle: { color: C.accent, fontSize: 84, fontWeight: '900', letterSpacing: 6, marginTop: 4 },
-  homeSub: { color: C.text, fontSize: 13, fontWeight: '800', letterSpacing: 5, marginBottom: 40 },
+  homeBody: { flex: 1, justifyContent: 'space-between', alignItems: 'center', paddingTop: topPad },
+  homeBodyLand: { flex: 1, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-around', paddingHorizontal: 24 },
+  homeLogoCol: { alignItems: 'center' },
+  homeLogoColLand: { flex: 1, alignItems: 'center', justifyContent: 'center' },
+  homeBtnCol: { alignItems: 'center', paddingBottom: 34 },
+  homeBtnColLand: { flex: 1, alignItems: 'center', justifyContent: 'center' },
+  playBtn: { backgroundColor: C.accent, borderRadius: 16, paddingVertical: 14, alignItems: 'center', shadowColor: C.accent, shadowOpacity: 0.6, shadowRadius: 14, shadowOffset: { width: 0, height: 4 }, elevation: 10, borderWidth: 1, borderColor: 'rgba(255,255,255,0.35)' },
+  playBtnText: { color: '#0a0a0d', fontSize: 28, fontWeight: '900', fontStyle: 'italic', letterSpacing: 8 },
+  playBtnSub: { color: 'rgba(10,10,13,0.75)', fontSize: 10, fontWeight: '800', letterSpacing: 3, marginTop: 1 },
+  homeRow: { flexDirection: 'row', marginTop: 12 },
+  homeSmallWrap: { flex: 1, marginHorizontal: 4 },
+  homeSmall: { backgroundColor: 'rgba(21,21,27,0.88)', borderColor: 'rgba(213,218,227,0.35)', borderWidth: 1, borderRadius: 12, paddingVertical: 12, alignItems: 'center' },
+  homeSmallTxt: { color: C.text, fontSize: 11, fontWeight: '900', letterSpacing: 2 },
+  homeBest: { color: C.muted, marginTop: 18, fontSize: 12, fontWeight: '800', letterSpacing: 2 },
+  modalCard: { width: '100%', maxWidth: 380, backgroundColor: C.card, borderColor: C.line, borderWidth: 1, borderRadius: 18, padding: 18 },
+  aboutVer: { color: C.accent, fontSize: 11, fontWeight: '900', letterSpacing: 3, textAlign: 'center', marginTop: 4, marginBottom: 12 },
+  aboutTxt: { color: C.text, fontSize: 13, lineHeight: 19, textAlign: 'center', marginTop: 6 },
   startBtn: { backgroundColor: C.accent, borderRadius: 18, paddingVertical: 18, paddingHorizontal: 70, alignItems: 'center' },
   startBtnText: { color: '#111827', fontSize: 22, fontWeight: '900', letterSpacing: 4 },
-  homeBest: { color: C.muted, marginTop: 22, fontSize: 12, fontWeight: '800', letterSpacing: 2 },
 
-  bottomBar: { position: 'absolute', left: 0, right: 0, bottom: 0, paddingHorizontal: 16, paddingTop: 10, paddingBottom: 22, backgroundColor: 'rgba(11,18,32,0.96)', borderTopWidth: 1, borderTopColor: C.line },
+  splashRoot: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: '#0a0a0d', alignItems: 'center', justifyContent: 'center', overflow: 'hidden' },
+  splashLoad: { position: 'absolute', bottom: 64, alignItems: 'center' },
+  splashTrack: { height: 4, borderRadius: 2, backgroundColor: 'rgba(255,255,255,0.14)', overflow: 'hidden' },
+  splashFill: { height: 4, borderRadius: 2, backgroundColor: C.accent },
+  splashLoadTxt: { color: C.muted, fontSize: 11, fontWeight: '800', letterSpacing: 5, marginTop: 10 },
+  streak: { position: 'absolute', top: 0, width: 2, borderRadius: 1 },
+
+  bottomBar: { position: 'absolute', left: 0, right: 0, bottom: 0, paddingHorizontal: 16, paddingTop: 10, paddingBottom: 22, backgroundColor: 'rgba(10,10,13,0.96)', borderTopWidth: 1, borderTopColor: C.line },
   speedBadge: { position: 'absolute', right: 12, bottom: 10, alignItems: 'flex-end' },
   speedBadgeNum: { color: C.cyan, fontSize: 30, fontWeight: '900' },
   speedBadgeUnit: { color: C.muted, fontSize: 10, fontWeight: '800', letterSpacing: 2 },
@@ -2616,6 +3216,23 @@ const styles = StyleSheet.create({
   chTitle: { color: C.bad, fontSize: 11, fontWeight: '900', letterSpacing: 2 },
   chHint: { color: C.muted, fontSize: 11, marginTop: 2 },
   chHud: { color: '#fca5a5', fontSize: 11, fontWeight: '900', letterSpacing: 1, textAlign: 'center', marginBottom: 4, textShadowColor: 'rgba(0,0,0,0.8)', textShadowRadius: 3 },
+  soundPill: { marginTop: 18, borderWidth: 1, borderColor: C.line, backgroundColor: C.card, borderRadius: 14, paddingHorizontal: 12, paddingVertical: 6 },
+  soundPillText: { color: C.muted, fontSize: 10, fontWeight: '900', letterSpacing: 1.5 },
+  gTop: { paddingTop: topPad, paddingHorizontal: 16 },
+  rankText: { color: C.cyan, fontSize: 11, fontWeight: '800', letterSpacing: 2, marginTop: 2 },
+  xpLine: { color: C.muted, fontSize: 11, fontWeight: '600', marginTop: 4 },
+  tabsBar: { flexDirection: 'row', marginHorizontal: 16, marginVertical: 12, backgroundColor: C.card, borderRadius: 14, padding: 4, borderWidth: 1, borderColor: C.line },
+  tabBtn: { flex: 1, paddingVertical: 9, borderRadius: 10, alignItems: 'center' },
+  tabBtnOn: { backgroundColor: C.accent },
+  tabBtnTxt: { color: C.muted, fontSize: 12, fontWeight: '900', letterSpacing: 1 },
+  tabScroll: { paddingHorizontal: 16, paddingBottom: 130, paddingTop: 2 },
+  arrow: { position: 'absolute', top: '38%', width: 40, height: 58, alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(0,0,0,0.4)', borderRadius: 12 },
+  arrowTxt: { color: C.text, fontSize: 30, fontWeight: '900', marginTop: -4 },
+  counter: { position: 'absolute', bottom: 10, alignSelf: 'center', color: C.muted, fontSize: 11, fontWeight: '800', letterSpacing: 2 },
+  infoChips: { flexDirection: 'row', flexWrap: 'wrap', marginTop: 10 },
+  infoChip: { color: C.text, fontSize: 11, fontWeight: '800', letterSpacing: 1, backgroundColor: C.card, borderColor: C.line, borderWidth: 1, borderRadius: 10, paddingHorizontal: 10, paddingVertical: 5, marginRight: 8, marginBottom: 6, overflow: 'hidden' },
+  sectionTitle: { color: C.muted, fontSize: 11, fontWeight: '800', letterSpacing: 2, marginTop: 16 },
+  modeBox: { backgroundColor: C.card, borderColor: C.line, borderWidth: 1, borderRadius: 14, padding: 12, marginTop: 12, alignItems: 'flex-start' },
   readyKicker: { color: C.accent, fontSize: 13, fontWeight: '900', letterSpacing: 3, marginBottom: 6 },
   readyHint: { color: C.text, fontSize: 14, textAlign: 'center', lineHeight: 20, marginVertical: 18, maxWidth: 320 },
 });

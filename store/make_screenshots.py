@@ -15,9 +15,9 @@ FONT = '/usr/share/fonts/truetype/google-fonts/Poppins-Bold.ttf'
 CAPTIONS = [
     'Endless 3D highway racing',
     'Tilt your phone to steer',
-    'Tap to BOOST to 220 km/h',
+    'Tap to BOOST past traffic',
     'Near misses = bonus score',
-    'Unlock bikes, cars & supercars',
+    'Unlock bikes, cars & hypercars',
     'Drive in car mode (landscape)',
     'Day, evening & night cycle',
     'Free & offline - no ads',
@@ -36,7 +36,7 @@ def frame(src, caption, dst):
     land = im.width > im.height
     W, H = (1920, 1080) if land else (1080, 1920)
     bar = 150
-    canvas = Image.new('RGB', (W, H), '#0b1220')
+    canvas = Image.new('RGB', (W, H), '#0a0a0d')
     avail_h = H - bar - 40
     avail_w = W - 80
     s = min(avail_w / im.width, avail_h / im.height)
@@ -48,7 +48,7 @@ def frame(src, caption, dst):
     while d.textlength(caption, font=f) > W - 80 and size > 24:
         size -= 2
         f = font(size)
-    d.text(((W - d.textlength(caption, font=f)) / 2, 36), caption, font=f, fill='#ff7a18')
+    d.text(((W - d.textlength(caption, font=f)) / 2, 36), caption, font=f, fill='#ff2d3d')
     canvas.save(dst)
 
 
